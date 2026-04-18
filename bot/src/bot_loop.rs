@@ -4,12 +4,16 @@
 //   1) входящие сообщения с cTrader
 //   2) команды от API
 //   3) heartbeat по таймеру
+//
+// Все исходящие клиенту (WS) события — это `dto::WsFrame`, которые
+// отправляются через `state.ws_tx`. API слой просто форвардит их в сокет.
 
+use crate::api::dto::{self, OrderStatus, WsFrame};
 use crate::connection::CTraderConnection;
 use crate::state::{
     f64_to_proto_volume, order_from_proto, parse_order_type, parse_side, position_from_proto,
-    proto, proto_price_to_f64, AppState, BotCommand, BotEvent, PlaceOrderArgs, PlaceOrderResult,
-    Position, Quote, Tick, STATUS_DISCONNECTED,
+    proto, proto_price_to_f64, AppState, BotCommand, PlaceOrderArgs, PlaceOrderResult, Position,
+    Quote, STATUS_DISCONNECTED,
 };
 use anyhow::Result;
 use prost::Message;
@@ -25,6 +29,23 @@ fn wrap(payload_type: u32, inner: &impl Message) -> proto::ProtoMessage {
         payload_type,
         payload: Some(inner.encode_to_vec()),
         client_msg_id: None,
+    }
+}
+
+/// Fire-and-forget broadcast. `SendError` just means no subscribers.
+fn emit(state: &Arc<AppState>, frame: WsFrame) {
+    let _ = state.ws_tx.send(frame);
+}
+
+fn position_frame(p: &Position, state: &Arc<AppState>) -> WsFrame {
+    WsFrame::PositionUpdate {
+        position: dto::Position::from_state(p, &state.symbols),
+    }
+}
+
+fn order_frame(o: &crate::state::Order, state: &Arc<AppState>) -> WsFrame {
+    WsFrame::OrderUpdate {
+        order: dto::Order::from_state(o, &state.symbols),
     }
 }
 
@@ -126,10 +147,13 @@ pub async fn run(
     mut cmd_rx: mpsc::Receiver<BotCommand>,
 ) -> Result<()> {
     // Status is set to AUTHENTICATED by main.rs after a successful account auth.
-    // We broadcast the transition here so WS subscribers learn about it.
-    let _ = state.event_tx.send(BotEvent::ConnectionStatusChanged {
-        status: "authenticated".into(),
-    });
+    // Broadcast the transition so fresh WS subscribers learn about it.
+    emit(
+        &state,
+        WsFrame::Status {
+            connection: dto::ConnectionState::from_raw(state.status()),
+        },
+    );
 
     let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
 
@@ -142,8 +166,8 @@ pub async fn run(
                     Err(e) => {
                         warn!("Соединение оборвано: {}", e);
                         state.set_status(STATUS_DISCONNECTED);
-                        let _ = state.event_tx.send(BotEvent::ConnectionStatusChanged {
-                            status: "disconnected".into(),
+                        emit(&state, WsFrame::Status {
+                            connection: dto::ConnectionState::Disconnected,
                         });
                         return Err(e);
                     }
@@ -157,7 +181,7 @@ pub async fn run(
                 handle_command(cmd, &state, &mut conn).await;
             }
 
-            // heartbeat
+            // heartbeat: cтавим ping в cTrader и одновременно пушим клиенту.
             _ = heartbeat.tick() => {
                 let pong = proto::ProtoHeartbeatEvent {
                     payload_type: Some(proto::ProtoPayloadType::HeartbeatEvent as i32),
@@ -166,6 +190,8 @@ pub async fn run(
                 if let Err(e) = conn.send(&envelope).await {
                     warn!("Не удалось отправить heartbeat: {}", e);
                 }
+                let now_ms = state.mark_heartbeat();
+                emit(&state, WsFrame::Heartbeat { at: now_ms });
             }
         }
     }
@@ -179,7 +205,8 @@ async fn handle_incoming(
     let pt = msg.payload_type;
 
     if pt == proto::ProtoPayloadType::HeartbeatEvent as u32 {
-        // cервер пингует — отвечаем
+        // Сервер пингует — отвечаем. Не трогаем last_heartbeat_at здесь:
+        // это broker-пинг, не клиент-пинг.
         let pong = proto::ProtoHeartbeatEvent {
             payload_type: Some(proto::ProtoPayloadType::HeartbeatEvent as i32),
         };
@@ -197,37 +224,39 @@ async fn handle_incoming(
                 timestamp_ms: spot.timestamp,
             };
             state.quotes.insert(spot.symbol_id, quote);
-            let _ = state.tick_tx.send(Tick {
-                symbol_id: spot.symbol_id,
-                bid,
-                ask,
-                timestamp_ms: spot.timestamp,
-            });
+            // Emit only when we have both sides; otherwise clients can't compute spread.
+            if let (Some(bid), Some(ask)) = (bid, ask) {
+                emit(
+                    state,
+                    WsFrame::Tick {
+                        symbol: state.symbols.name(spot.symbol_id),
+                        bid,
+                        ask,
+                        time: spot.timestamp.unwrap_or(0).max(0),
+                    },
+                );
+            }
         }
     } else if pt == proto::ProtoOaPayloadType::ProtoOaExecutionEvent as u32 {
         if let Some(payload) = msg.payload.as_ref() {
             let exec = proto::ProtoOaExecutionEvent::decode(payload.as_slice())?;
             apply_execution(&exec, state).await;
-            let _ = state.event_tx.send(BotEvent::Execution {
-                execution_type: format!("{:?}", exec.execution_type),
-                position_id: exec.position.as_ref().map(|p| p.position_id),
-                order_id: exec.order.as_ref().map(|o| o.order_id),
-            });
         }
     } else if pt == proto::ProtoOaPayloadType::ProtoOaOrderErrorEvent as u32 {
         if let Some(payload) = msg.payload.as_ref() {
             let err = proto::ProtoOaOrderErrorEvent::decode(payload.as_slice())?;
-            warn!(
-                "OrderError: {} — {}",
-                err.error_code,
-                err.description.clone().unwrap_or_default()
-            );
-            let _ = state.event_tx.send(BotEvent::OrderError {
-                error_code: err.error_code,
-                description: err.description.unwrap_or_default(),
-                order_id: err.order_id,
-                position_id: err.position_id,
-            });
+            let description = err.description.clone().unwrap_or_default();
+            warn!("OrderError: {} — {}", err.error_code, description);
+            if let Some(order_id) = err.order_id {
+                emit(
+                    state,
+                    WsFrame::Execution {
+                        order_id: order_id.to_string(),
+                        status: OrderStatus::Rejected,
+                        detail: Some(format!("{}: {}", err.error_code, description)),
+                    },
+                );
+            }
         }
     } else if pt == proto::ProtoOaPayloadType::ProtoOaErrorRes as u32 {
         if let Some(payload) = msg.payload.as_ref() {
@@ -246,41 +275,67 @@ async fn handle_incoming(
 }
 
 async fn apply_execution(exec: &proto::ProtoOaExecutionEvent, state: &Arc<AppState>) {
-    // Обновляем позицию/ордер в state по факту execution event.
+    // Position side — update or remove, and broadcast the corresponding frame.
     if let Some(pos) = exec.position.as_ref() {
+        let closed =
+            pos.position_status == proto::ProtoOaPositionStatus::PositionStatusClosed as i32;
         let updated = position_from_proto(pos);
-        let mut positions = state.positions.write().await;
-        if let Some(existing) = positions
-            .iter_mut()
-            .find(|p| p.position_id == updated.position_id)
         {
-            *existing = updated;
-        } else {
-            positions.push(updated);
+            let mut positions = state.positions.write().await;
+            if let Some(existing) = positions
+                .iter_mut()
+                .find(|p| p.position_id == updated.position_id)
+            {
+                *existing = updated.clone();
+            } else if !closed {
+                positions.push(updated.clone());
+            }
+            if closed {
+                positions.retain(|p| p.position_id != pos.position_id);
+            }
         }
-        // Если позиция закрыта — удаляем.
-        if pos.position_status == proto::ProtoOaPositionStatus::PositionStatusClosed as i32 {
-            positions.retain(|p| p.position_id != pos.position_id);
+        if closed {
+            emit(
+                state,
+                WsFrame::PositionClosed {
+                    position_id: pos.position_id.to_string(),
+                },
+            );
+        } else {
+            emit(state, position_frame(&updated, state));
         }
     }
 
+    // Order side — update or remove, and emit order_update + execution frames.
     if let Some(order) = exec.order.as_ref() {
         let updated = order_from_proto(order);
-        let mut orders = state.orders.write().await;
-        if let Some(existing) = orders.iter_mut().find(|o| o.order_id == updated.order_id) {
-            *existing = updated;
-        } else {
-            orders.push(updated);
-        }
-        // Убираем исполненные/отменённые/просроченные ордера.
-        let st = order.order_status;
-        if st == proto::ProtoOaOrderStatus::OrderStatusFilled as i32
-            || st == proto::ProtoOaOrderStatus::OrderStatusCancelled as i32
-            || st == proto::ProtoOaOrderStatus::OrderStatusExpired as i32
-            || st == proto::ProtoOaOrderStatus::OrderStatusRejected as i32
+        let terminal = matches!(
+            order.order_status,
+            s if s == proto::ProtoOaOrderStatus::OrderStatusFilled as i32
+                || s == proto::ProtoOaOrderStatus::OrderStatusCancelled as i32
+                || s == proto::ProtoOaOrderStatus::OrderStatusExpired as i32
+                || s == proto::ProtoOaOrderStatus::OrderStatusRejected as i32
+        );
         {
-            orders.retain(|o| o.order_id != order.order_id);
+            let mut orders = state.orders.write().await;
+            if let Some(existing) = orders.iter_mut().find(|o| o.order_id == updated.order_id) {
+                *existing = updated.clone();
+            } else if !terminal {
+                orders.push(updated.clone());
+            }
+            if terminal {
+                orders.retain(|o| o.order_id != order.order_id);
+            }
         }
+        emit(state, order_frame(&updated, state));
+        emit(
+            state,
+            WsFrame::Execution {
+                order_id: order.order_id.to_string(),
+                status: OrderStatus::from_internal(updated.status),
+                detail: None,
+            },
+        );
     }
 }
 
