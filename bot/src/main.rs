@@ -32,6 +32,7 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
+        let _ = dotenvy::from_filename(concat!(env!("CARGO_MANIFEST_DIR"), "/.env"));
         dotenvy::dotenv().ok();
         Ok(Self {
             client_id: std::env::var("CTRADER_CLIENT_ID")?,
