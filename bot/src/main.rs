@@ -10,6 +10,9 @@ mod bot_loop;
 mod connection;
 mod state;
 
+#[cfg(test)]
+mod tests;
+
 use anyhow::Result;
 use std::net::SocketAddr;
 use tokio::sync::{broadcast, mpsc};

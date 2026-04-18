@@ -50,3 +50,10 @@ chrono = { version = "0.4", features = ["serde"] }
 [build-dependencies]
 # Компиляция .proto файлов в Rust
 prost-build = "0.13"
+
+[dev-dependencies]
+# ServiceExt::oneshot() for in-process Router testing.
+tower = { version = "0.5", features = ["util"] }
+# http::Request / StatusCode helpers for crafting test requests.
+http = "1"
+http-body-util = "0.1"
