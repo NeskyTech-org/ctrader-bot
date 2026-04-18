@@ -120,6 +120,91 @@ impl OrderStatus {
 
 #[derive(Serialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
+pub struct Account {
+    pub id: String,
+    pub balance: f64,
+    pub equity: f64,
+    pub margin: f64,
+    pub free_margin: f64,
+    pub currency: String,
+}
+
+/// One closed trade — appended to `AppState::trades` on a closing execution.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct Trade {
+    pub id: String,
+    pub position_id: String,
+    pub symbol: String,
+    pub side: Side,
+    pub volume: f64,
+    pub open_price: f64,
+    pub close_price: f64,
+    pub pnl: f64,
+    pub opened_at: String,
+    pub closed_at: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StrategyState {
+    Stopped,
+    Running,
+    Paused,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct StrategyStatus {
+    pub name: String,
+    pub state: StrategyState,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uptime_seconds: Option<u64>,
+    pub params: serde_json::Value,
+}
+
+impl Default for StrategyStatus {
+    fn default() -> Self {
+        StrategyStatus {
+            name: "none".into(),
+            state: StrategyState::Stopped,
+            uptime_seconds: None,
+            params: serde_json::json!({}),
+        }
+    }
+}
+
+/// Shared error envelope for non-2xx HTTP responses. Matches the UI's
+/// `ApiError` parser: `{ error: { code, message, details? } }`.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiErrorBody {
+    pub error: ApiErrorDetail,
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct ApiErrorDetail {
+    pub code: String,
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
+}
+
+impl ApiErrorBody {
+    pub fn new(code: impl Into<String>, message: impl Into<String>) -> Self {
+        ApiErrorBody {
+            error: ApiErrorDetail {
+                code: code.into(),
+                message: message.into(),
+                details: None,
+            },
+        }
+    }
+}
+
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
 pub struct Status {
     pub connection: ConnectionState,
     pub uptime_seconds: u64,
