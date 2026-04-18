@@ -8,12 +8,12 @@
 // Все исходящие клиенту (WS) события — это `dto::WsFrame`, которые
 // отправляются через `state.ws_tx`. API слой просто форвардит их в сокет.
 
-use crate::api::dto::{self, OrderStatus, WsFrame};
+use crate::api::dto::{self, OrderStatus, Side as DtoSide, WsFrame};
 use crate::connection::CTraderConnection;
 use crate::state::{
     f64_to_proto_volume, order_from_proto, parse_order_type, parse_side, position_from_proto,
-    proto, proto_price_to_f64, AppState, BotCommand, PlaceOrderArgs, PlaceOrderResult, Position,
-    Quote, STATUS_DISCONNECTED,
+    proto, proto_price_to_f64, proto_volume_to_f64, AppState, BotCommand, PlaceOrderArgs,
+    PlaceOrderResult, Position, Quote, STATUS_DISCONNECTED, TRADES_CAPACITY,
 };
 use anyhow::Result;
 use prost::Message;
@@ -47,6 +47,50 @@ fn order_frame(o: &crate::state::Order, state: &Arc<AppState>) -> WsFrame {
     WsFrame::OrderUpdate {
         order: dto::Order::from_state(o, &state.symbols),
     }
+}
+
+/// Append a closed-deal Trade to `state.trades`, evicting the oldest entry
+/// if we're at capacity. The closing-deal side is the opposite of the
+/// position side, so we flip it for the Trade record.
+async fn append_trade(
+    state: &Arc<AppState>,
+    deal: &proto::ProtoOaDeal,
+    detail: &proto::ProtoOaClosePositionDetail,
+    position_snapshot: &Position,
+) {
+    let money_digits = detail.money_digits.unwrap_or(2) as i32;
+    let scale = 10f64.powi(money_digits);
+
+    // Closing deal's trade_side is the opposite of the position's.
+    let position_side = if deal.trade_side == proto::ProtoOaTradeSide::Buy as i32 {
+        DtoSide::Sell
+    } else {
+        DtoSide::Buy
+    };
+
+    let volume = detail
+        .closed_volume
+        .map(proto_volume_to_f64)
+        .unwrap_or_else(|| proto_volume_to_f64(deal.filled_volume));
+
+    let trade = dto::Trade {
+        id: deal.deal_id.to_string(),
+        position_id: deal.position_id.to_string(),
+        symbol: state.symbols.name(deal.symbol_id),
+        side: position_side,
+        volume,
+        open_price: detail.entry_price,
+        close_price: deal.execution_price.unwrap_or(0.0),
+        pnl: detail.gross_profit as f64 / scale,
+        opened_at: dto::rfc3339_from_ms(position_snapshot.open_timestamp_ms.unwrap_or(0)),
+        closed_at: dto::rfc3339_from_ms(deal.execution_timestamp),
+    };
+
+    let mut trades = state.trades.write().await;
+    if trades.len() >= TRADES_CAPACITY {
+        trades.pop_front();
+    }
+    trades.push_back(trade);
 }
 
 /// Первоначальная синхронизация состояния: позиции и pending ордера.
@@ -280,6 +324,16 @@ async fn apply_execution(exec: &proto::ProtoOaExecutionEvent, state: &Arc<AppSta
         let closed =
             pos.position_status == proto::ProtoOaPositionStatus::PositionStatusClosed as i32;
         let updated = position_from_proto(pos);
+
+        // Capture a Trade for closing deals before we drop the position.
+        if closed {
+            if let Some(deal) = exec.deal.as_ref() {
+                if let Some(detail) = deal.close_position_detail.as_ref() {
+                    append_trade(state, deal, detail, &updated).await;
+                }
+            }
+        }
+
         {
             let mut positions = state.positions.write().await;
             if let Some(existing) = positions
