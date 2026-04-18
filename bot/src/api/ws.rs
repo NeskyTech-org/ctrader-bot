@@ -1,9 +1,11 @@
 // ws.rs — WebSocket endpoint.
 //
-// На подключении: snapshot (quotes + positions + status).
-// Затем — поток из tick_tx и event_tx через broadcast::Receiver.
+// Frames follow the UI's WsMessageSchema (kind-tagged, camelCase fields).
+// On connect we replay the current view of the world: status + every open
+// position + every pending order. Then we forward the live `ws_tx` stream.
 
-use crate::state::{AppState, BotEvent, Tick};
+use std::sync::Arc;
+
 use axum::{
     extract::{
         ws::{Message, WebSocket},
@@ -11,23 +13,11 @@ use axum::{
     },
     response::IntoResponse,
 };
-use serde::Serialize;
-use std::sync::Arc;
 use tokio::sync::broadcast;
 use tracing::debug;
 
-#[derive(Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-enum WsOut<'a> {
-    Snapshot {
-        status: &'a str,
-        quotes: Vec<crate::state::Quote>,
-        positions: Vec<crate::state::Position>,
-        orders: Vec<crate::state::Order>,
-    },
-    Tick(Tick),
-    Event(BotEvent),
-}
+use crate::api::dto::{self, WsFrame};
+use crate::state::AppState;
 
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
@@ -36,63 +26,69 @@ pub async fn ws_handler(
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
+async fn send_frame(socket: &mut WebSocket, frame: &WsFrame) -> bool {
+    match serde_json::to_string(frame) {
+        Ok(text) => socket.send(Message::Text(text)).await.is_ok(),
+        Err(_) => true, // a ser error shouldn't kill the socket
+    }
+}
+
 async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
-    // Snapshot
-    let snapshot = {
-        let positions = state.positions.read().await.clone();
-        let orders = state.orders.read().await.clone();
-        let quotes: Vec<_> = state.quotes.iter().map(|e| e.value().clone()).collect();
-        WsOut::Snapshot {
-            status: crate::state::status_str(state.status()),
-            quotes,
-            positions,
-            orders,
-        }
+    // 1) Status snapshot.
+    let status_frame = WsFrame::Status {
+        connection: dto::ConnectionState::from_raw(state.status()),
     };
-    if let Ok(text) = serde_json::to_string(&snapshot) {
-        if socket.send(Message::Text(text)).await.is_err() {
-            return;
+    if !send_frame(&mut socket, &status_frame).await {
+        return;
+    }
+
+    // 2) Replay open positions.
+    {
+        let positions = state.positions.read().await;
+        for p in positions.iter() {
+            let frame = WsFrame::PositionUpdate {
+                position: dto::Position::from_state(p, &state.symbols),
+            };
+            if !send_frame(&mut socket, &frame).await {
+                return;
+            }
         }
     }
 
-    let mut tick_rx = state.tick_tx.subscribe();
-    let mut event_rx = state.event_tx.subscribe();
+    // 3) Replay pending orders.
+    {
+        let orders = state.orders.read().await;
+        for o in orders.iter() {
+            let frame = WsFrame::OrderUpdate {
+                order: dto::Order::from_state(o, &state.symbols),
+            };
+            if !send_frame(&mut socket, &frame).await {
+                return;
+            }
+        }
+    }
 
+    // 4) Live stream. Client messages (subscribe etc.) are accepted and ignored
+    //    for now — the server already pushes everything.
+    let mut rx = state.ws_tx.subscribe();
     loop {
         tokio::select! {
-            tick = tick_rx.recv() => {
-                match tick {
-                    Ok(t) => {
-                        if let Ok(text) = serde_json::to_string(&WsOut::Tick(t)) {
-                            if socket.send(Message::Text(text)).await.is_err() {
-                                break;
-                            }
-                        }
+            frame = rx.recv() => match frame {
+                Ok(f) => {
+                    if !send_frame(&mut socket, &f).await {
+                        break;
                     }
-                    Err(broadcast::error::RecvError::Lagged(n)) => {
-                        debug!("WS отстал на {} тиков", n);
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
                 }
-            }
-            event = event_rx.recv() => {
-                match event {
-                    Ok(ev) => {
-                        if let Ok(text) = serde_json::to_string(&WsOut::Event(ev)) {
-                            if socket.send(Message::Text(text)).await.is_err() {
-                                break;
-                            }
-                        }
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(broadcast::error::RecvError::Closed) => break,
+                Err(broadcast::error::RecvError::Lagged(n)) => {
+                    debug!("WS subscriber lagged by {} frames", n);
                 }
-            }
+                Err(broadcast::error::RecvError::Closed) => break,
+            },
             incoming = socket.recv() => {
                 match incoming {
                     Some(Ok(Message::Close(_))) | None => break,
                     Some(Err(_)) => break,
-                    _ => {} // ignoring text/ping/pong from client for now
+                    _ => {}
                 }
             }
         }

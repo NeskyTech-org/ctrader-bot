@@ -14,6 +14,17 @@ use serde::{Deserialize, Serialize};
 use crate::api::symbols::SymbolCatalog;
 use crate::state;
 
+/// Current unix time in milliseconds. Used for `lastHeartbeatAt` and the
+/// `at` field on `WsFrame::Heartbeat`.
+pub fn now_unix_ms() -> i64 {
+    Utc::now().timestamp_millis()
+}
+
+/// Format a unix-ms instant as RFC 3339 (UTC, second precision, trailing Z).
+pub fn rfc3339_from_ms(ms: i64) -> String {
+    format_ms_rfc3339(Some(ms))
+}
+
 // ─────────────────────────────────────────────────────────── primitive enums
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -121,6 +132,7 @@ pub struct Status {
 impl Status {
     pub fn from_state(s: &state::AppState) -> Self {
         let info = s.status_info();
+        let last_hb_ms = s.last_heartbeat_at();
         Status {
             connection: ConnectionState::from_raw(s.status()),
             uptime_seconds: info.uptime_secs,
@@ -129,7 +141,11 @@ impl Status {
             } else {
                 Some(info.account_id.to_string())
             },
-            last_heartbeat_at: None, // surfaced in PR-B2
+            last_heartbeat_at: if last_hb_ms > 0 {
+                Some(rfc3339_from_ms(last_hb_ms))
+            } else {
+                None
+            },
         }
     }
 }
@@ -227,6 +243,66 @@ impl Order {
             created_at: format_ms_rfc3339(o.created_at_ms),
         }
     }
+}
+
+// ────────────────────────────────────────────────── WebSocket outbound frames
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum LogLevel {
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+/// Every frame the server pushes to WS clients. Matches the UI's
+/// `WsMessageSchema` discriminated union: a `kind` tag + per-variant fields
+/// in camelCase.
+#[derive(Serialize, Clone, Debug)]
+#[serde(
+    tag = "kind",
+    rename_all = "snake_case",
+    rename_all_fields = "camelCase"
+)]
+pub enum WsFrame {
+    Tick {
+        symbol: String,
+        bid: f64,
+        ask: f64,
+        time: i64,
+    },
+    Execution {
+        order_id: String,
+        status: OrderStatus,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+    PositionUpdate {
+        position: Position,
+    },
+    PositionClosed {
+        position_id: String,
+    },
+    OrderUpdate {
+        order: Order,
+    },
+    Status {
+        connection: ConnectionState,
+    },
+    Heartbeat {
+        at: i64,
+    },
+    // Wired up in PR-B4 (tracing Layer -> WS log channel).
+    #[allow(dead_code)]
+    Log {
+        level: LogLevel,
+        message: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        fields: Option<serde_json::Value>,
+        at: String,
+    },
 }
 
 // ────────────────────────────────────────────────── inbound request DTOs
@@ -445,12 +521,58 @@ mod tests {
         // Using a bare state::AppState without a live connection — status_info()
         // only reads the atomic + started_at, no channels are touched.
         let (cmd_tx, _cmd_rx) = tokio::sync::mpsc::channel(1);
-        let (tick_tx, _) = tokio::sync::broadcast::channel(1);
-        let (event_tx, _) = tokio::sync::broadcast::channel(1);
-        let state = state::AppState::new(7, cmd_tx, tick_tx, event_tx);
+        let (ws_tx, _) = tokio::sync::broadcast::channel::<WsFrame>(1);
+        let state = state::AppState::new(7, cmd_tx, ws_tx);
         state.set_status(state::STATUS_AUTHENTICATED);
         let s = Status::from_state(&state);
         assert_eq!(s.connection, ConnectionState::Authenticated);
         assert_eq!(s.account_id, Some("7".to_string()));
+    }
+
+    #[test]
+    fn ws_frame_tick_serialises_with_kind_tag() {
+        let f = WsFrame::Tick {
+            symbol: "EURUSD".to_string(),
+            bid: 1.08,
+            ask: 1.08002,
+            time: 1_713_440_000_000,
+        };
+        let s = serde_json::to_string(&f).unwrap();
+        assert!(s.contains("\"kind\":\"tick\""));
+        assert!(s.contains("\"symbol\":\"EURUSD\""));
+        assert!(s.contains("\"bid\":1.08"));
+    }
+
+    #[test]
+    fn ws_frame_execution_uses_camel_case() {
+        let f = WsFrame::Execution {
+            order_id: "42".to_string(),
+            status: OrderStatus::Filled,
+            detail: Some("broker ok".into()),
+        };
+        let s = serde_json::to_string(&f).unwrap();
+        assert!(s.contains("\"kind\":\"execution\""));
+        assert!(s.contains("\"orderId\":\"42\""));
+        assert!(s.contains("\"status\":\"filled\""));
+        assert!(s.contains("\"detail\":\"broker ok\""));
+    }
+
+    #[test]
+    fn ws_frame_position_closed_emits_position_id() {
+        let f = WsFrame::PositionClosed {
+            position_id: "7".to_string(),
+        };
+        let s = serde_json::to_string(&f).unwrap();
+        assert!(s.contains("\"kind\":\"position_closed\""));
+        assert!(s.contains("\"positionId\":\"7\""));
+    }
+
+    #[test]
+    fn ws_frame_heartbeat_carries_timestamp() {
+        let f = WsFrame::Heartbeat {
+            at: 1_713_440_000_000,
+        };
+        let s = serde_json::to_string(&f).unwrap();
+        assert_eq!(s, "{\"kind\":\"heartbeat\",\"at\":1713440000000}");
     }
 }
