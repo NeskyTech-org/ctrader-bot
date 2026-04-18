@@ -69,9 +69,8 @@ async fn main() -> Result<()> {
 
     // 2. Каналы и общий state
     let (cmd_tx, cmd_rx) = mpsc::channel(64);
-    let (tick_tx, _) = broadcast::channel(1024);
-    let (event_tx, _) = broadcast::channel(256);
-    let state = state::AppState::new(config.account_id, cmd_tx, tick_tx, event_tx);
+    let (ws_tx, _) = broadcast::channel(1024);
+    let state = state::AppState::new(config.account_id, cmd_tx, ws_tx);
     state.set_status(state::STATUS_AUTHENTICATED);
 
     // 3. Symbol catalog (populates state.symbols so REST/WS can resolve names)
