@@ -18,12 +18,27 @@ use std::net::SocketAddr;
 use tokio::sync::{broadcast, mpsc};
 use tracing::{error, info};
 
-// Конфиг загружается из переменных окружения (.env файл)
+// Конфиг загружается из переменных окружения (.env файл).
+//
+// `access_token` is mutable: after `auth::authenticate` rotates it via
+// `ProtoOaRefreshTokenReq`, the in-memory value is updated and (best
+// effort) persisted back to `.env` so the next restart picks up the
+// fresh token instead of crashing on CH_ACCESS_TOKEN_INVALID. Same for
+// `refresh_token`, which cTrader may also rotate on every refresh.
+//
+// Access is deliberately a plain `String` rather than a redacting
+// newtype — secrets in `.env` get redacted at log sites instead
+// (`access_token = %"***"`), which is simpler than refactoring every
+// call site that needs the raw string.
 #[derive(Debug)]
 pub struct Config {
     pub client_id: String,
     pub client_secret: String,
     pub access_token: String,
+    /// Long-lived refresh token paired with `access_token`. When present
+    /// the bot can recover from an expired access token at startup (or
+    /// later — see `auth::authenticate`).
+    pub refresh_token: Option<String>,
     pub account_id: i64,
     pub host: String, // demo.ctraderapi.com или live.ctraderapi.com
     pub port: u16,    // 5035
@@ -34,10 +49,16 @@ impl Config {
     pub fn from_env() -> Result<Self> {
         let _ = dotenvy::from_filename(concat!(env!("CARGO_MANIFEST_DIR"), "/.env"));
         dotenvy::dotenv().ok();
+        // `CTRADER_REFRESH_TOKEN` treated as absent when empty (placeholder)
+        // so the `.env.example` stub doesn't trip the startup check.
+        let refresh_token = std::env::var("CTRADER_REFRESH_TOKEN")
+            .ok()
+            .filter(|v| !v.is_empty() && v != "your_refresh_token_here");
         Ok(Self {
             client_id: std::env::var("CTRADER_CLIENT_ID")?,
             client_secret: std::env::var("CTRADER_CLIENT_SECRET")?,
             access_token: std::env::var("CTRADER_ACCESS_TOKEN")?,
+            refresh_token,
             account_id: std::env::var("CTRADER_ACCOUNT_ID")?.parse()?,
             host: std::env::var("CTRADER_HOST")
                 .unwrap_or_else(|_| "demo.ctraderapi.com".to_string()),
@@ -92,13 +113,15 @@ async fn main() -> Result<()> {
 
     info!("Запуск cTrader Bot");
 
-    let config = Config::from_env()?;
+    let mut config = Config::from_env()?;
     info!("Конфиг загружен, аккаунт: {}", config.account_id);
 
-    // 1. Подключаемся + авторизуемся
+    // 1. Подключаемся + авторизуемся. `authenticate` may rotate
+    //    `config.access_token` / `.refresh_token` via
+    //    `ProtoOaRefreshTokenReq` if the saved access_token has expired.
     let mut conn = connection::CTraderConnection::new(&config).await?;
     info!("TCP/TLS соединение установлено");
-    auth::authenticate(&mut conn, &config).await?;
+    auth::authenticate(&mut conn, &mut config).await?;
     info!("Авторизация прошла успешно");
 
     // 2. Каналы и общий state
