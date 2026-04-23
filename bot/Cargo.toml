@@ -21,7 +21,11 @@ prost = "0.13"
 
 # Логирование и трейсинг
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Metrics — exposed as Prometheus text at GET /metrics
+metrics = "0.23"
+metrics-exporter-prometheus = { version = "0.15", default-features = false }
 
 # Конфигурация из .env
 dotenvy = "0.15"

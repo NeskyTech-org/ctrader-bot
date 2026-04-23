@@ -53,17 +53,42 @@ impl Config {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // fmt layer -> stdout (human or JSON depending on RUST_LOG).
-    // WsLogLayer -> WS /ws log channel, gated by the same EnvFilter.
-    // EnvFilter default: info for the world, debug for this crate.
+    // Layer stack:
+    //   fmt       → stdout (human-readable or JSON, toggled by LOG_FORMAT)
+    //   WsLogLayer → WS /ws `log` frames for the UI's Logs panel
+    //
+    // EnvFilter applies to both. Default: info everywhere, debug for this
+    // crate. Set `RUST_LOG` to override.
     use tracing_subscriber::{layer::SubscriberExt as _, util::SubscriberInitExt as _};
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info,ctrader_bot=debug"));
+
+    // LOG_FORMAT=json → structured line-delimited JSON, ready for log
+    // shippers (Vector, Promtail, filebeat). Anything else (or unset) →
+    // the default human-readable ANSI output we've been using for dev.
+    let log_format = std::env::var("LOG_FORMAT").unwrap_or_default();
+    let fmt_layer: Box<dyn tracing_subscriber::Layer<_> + Send + Sync> = if log_format == "json" {
+        Box::new(
+            tracing_subscriber::fmt::layer()
+                .json()
+                .flatten_event(true)
+                .with_current_span(true)
+                .with_span_list(false),
+        )
+    } else {
+        Box::new(tracing_subscriber::fmt::layer())
+    };
+
     tracing_subscriber::registry()
         .with(env_filter)
-        .with(tracing_subscriber::fmt::layer())
+        .with(fmt_layer)
         .with(api::log_layer::WsLogLayer)
         .init();
+
+    // Install the global Prometheus recorder before any `metrics::*!`
+    // macros fire. After this, every counter/gauge/histogram the bot
+    // emits is scrape-able at GET /metrics.
+    api::metrics::install()?;
 
     info!("Запуск cTrader Bot");
 

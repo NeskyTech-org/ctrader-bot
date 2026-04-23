@@ -23,9 +23,18 @@ pub async fn place_order(
     State(state): State<Arc<AppState>>,
     Json(req): Json<dto::PlaceOrderRequest>,
 ) -> Result<Json<dto::Order>, (StatusCode, String)> {
-    let args = req
-        .into_internal(&state.symbols)
-        .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
+    let side_label = req.side.as_internal();
+    let symbol_label = req.symbol.clone();
+    let args = req.into_internal(&state.symbols).map_err(|e| {
+        metrics::counter!(
+            "ctrader_bot_orders_rejected_total",
+            "reason" => "bad_request",
+            "side" => side_label,
+            "symbol" => symbol_label.clone(),
+        )
+        .increment(1);
+        (StatusCode::BAD_REQUEST, e)
+    })?;
 
     let (tx, rx) = oneshot::channel();
     state
@@ -37,8 +46,21 @@ pub async fn place_order(
     match rx.await {
         Ok(Ok(result)) => {
             if !result.accepted {
+                metrics::counter!(
+                    "ctrader_bot_orders_rejected_total",
+                    "reason" => "broker_rejected",
+                    "side" => side_label,
+                    "symbol" => symbol_label.clone(),
+                )
+                .increment(1);
                 return Err((StatusCode::BAD_REQUEST, result.message));
             }
+            metrics::counter!(
+                "ctrader_bot_orders_placed_total",
+                "side" => side_label,
+                "symbol" => symbol_label.clone(),
+            )
+            .increment(1);
             // The concrete Order appears in state.orders after the broker
             // emits an ExecutionEvent. Return the most recent order as a
             // best-effort synchronous handshake; the UI always waits for
@@ -53,7 +75,16 @@ pub async fn place_order(
                 )),
             }
         }
-        Ok(Err(e)) => Err((StatusCode::BAD_REQUEST, e)),
+        Ok(Err(e)) => {
+            metrics::counter!(
+                "ctrader_bot_orders_rejected_total",
+                "reason" => "bot_error",
+                "side" => side_label,
+                "symbol" => symbol_label,
+            )
+            .increment(1);
+            Err((StatusCode::BAD_REQUEST, e))
+        }
         Err(_) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             "bot loop dropped response".into(),

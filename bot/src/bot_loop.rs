@@ -33,7 +33,11 @@ fn wrap(payload_type: u32, inner: &impl Message) -> proto::ProtoMessage {
 }
 
 /// Fire-and-forget broadcast. `SendError` just means no subscribers.
+/// Also counts the frame by `kind` so `/metrics` can report the rate per
+/// frame type over time.
 fn emit(state: &Arc<AppState>, frame: WsFrame) {
+    metrics::counter!("ctrader_bot_ws_frames_emitted_total", "kind" => frame.kind_str())
+        .increment(1);
     let _ = state.ws_tx.send(frame);
 }
 
@@ -424,11 +428,17 @@ async fn apply_execution(exec: &proto::ProtoOaExecutionEvent, state: &Arc<AppSta
             }
         }
         emit(state, order_frame(&updated, state));
+        let exec_status = OrderStatus::from_internal(updated.status);
+        metrics::counter!(
+            "ctrader_bot_executions_total",
+            "status" => exec_status.as_str(),
+        )
+        .increment(1);
         emit(
             state,
             WsFrame::Execution {
                 order_id: order.order_id.to_string(),
-                status: OrderStatus::from_internal(updated.status),
+                status: exec_status,
                 detail: None,
             },
         );

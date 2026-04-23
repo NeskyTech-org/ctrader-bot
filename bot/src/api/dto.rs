@@ -114,6 +114,17 @@ impl OrderStatus {
             _ => OrderStatus::Pending,
         }
     }
+
+    /// Static label for metrics — matches the serde `rename_all = "snake_case"`
+    /// tag on the wire.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            OrderStatus::Pending => "pending",
+            OrderStatus::Filled => "filled",
+            OrderStatus::Cancelled => "cancelled",
+            OrderStatus::Rejected => "rejected",
+        }
+    }
 }
 
 // ─────────────────────────────────────────────────────────────── DTO structs
@@ -388,6 +399,26 @@ pub enum WsFrame {
         fields: Option<serde_json::Value>,
         at: String,
     },
+}
+
+impl WsFrame {
+    /// Discriminant as a static string — stable identifier used for
+    /// Prometheus label values (`ctrader_bot_ws_frames_emitted_total{kind=…}`)
+    /// and any other place we need the variant name without serialising.
+    /// Mirrors the `tag = "kind", rename_all = "snake_case"` serde config
+    /// above — keep them aligned.
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            WsFrame::Tick { .. } => "tick",
+            WsFrame::Execution { .. } => "execution",
+            WsFrame::PositionUpdate { .. } => "position_update",
+            WsFrame::PositionClosed { .. } => "position_closed",
+            WsFrame::OrderUpdate { .. } => "order_update",
+            WsFrame::Status { .. } => "status",
+            WsFrame::Heartbeat { .. } => "heartbeat",
+            WsFrame::Log { .. } => "log",
+        }
+    }
 }
 
 // ────────────────────────────────────────────────── inbound request DTOs

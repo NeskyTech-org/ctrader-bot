@@ -10,6 +10,7 @@ use tower_http::cors::{Any, CorsLayer};
 
 pub mod dto;
 pub mod log_layer;
+pub mod metrics;
 pub mod routes;
 pub mod symbols;
 pub mod ws;
@@ -43,6 +44,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             put(routes::strategy::update_strategy_params),
         )
         .route("/ws", get(ws::ws_handler))
+        // Prometheus scrape endpoint. Conventionally lives at root `/metrics`,
+        // not under `/api/*` — scrapers expect that path.
+        .route("/metrics", get(metrics::metrics_handler))
         .with_state(state)
         .layer(cors)
 }
