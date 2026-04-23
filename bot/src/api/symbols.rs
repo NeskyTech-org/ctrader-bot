@@ -49,9 +49,15 @@ impl SymbolCatalog {
         fallback
     }
 
-    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.map.len()
+    }
+
+    // Required by clippy's `len_without_is_empty` for any type with a
+    // public `len()`. Not called today; present to satisfy the lint.
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
     }
 }
 

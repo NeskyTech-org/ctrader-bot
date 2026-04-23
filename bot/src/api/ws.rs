@@ -26,6 +26,17 @@ pub async fn ws_handler(
     ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
+/// Drops the `ws_clients_connected` gauge on scope exit. Using an RAII
+/// guard (rather than trailing `decrement` calls) covers every early
+/// return path in `handle_socket` without manual bookkeeping.
+struct ConnectedGuard;
+
+impl Drop for ConnectedGuard {
+    fn drop(&mut self) {
+        metrics::gauge!("ctrader_bot_ws_clients_connected").decrement(1.0);
+    }
+}
+
 async fn send_frame(socket: &mut WebSocket, frame: &WsFrame) -> bool {
     match serde_json::to_string(frame) {
         Ok(text) => socket.send(Message::Text(text)).await.is_ok(),
@@ -34,6 +45,10 @@ async fn send_frame(socket: &mut WebSocket, frame: &WsFrame) -> bool {
 }
 
 async fn handle_socket(mut socket: WebSocket, state: Arc<AppState>) {
+    metrics::gauge!("ctrader_bot_ws_clients_connected").increment(1.0);
+    metrics::counter!("ctrader_bot_ws_connections_total").increment(1);
+    let _guard = ConnectedGuard;
+
     // 1) Status snapshot.
     let status_frame = WsFrame::Status {
         connection: dto::ConnectionState::from_raw(state.status()),

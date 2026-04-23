@@ -318,3 +318,142 @@ fn trades_capacity_is_five_thousand() {
     // Guard against someone accidentally dropping the cap.
     assert_eq!(TRADES_CAPACITY, 5_000);
 }
+
+#[tokio::test]
+async fn get_metrics_returns_prometheus_text() {
+    // The recorder is a global — in the test harness we don't install it
+    // (tests share a process, and re-installing panics). The handler
+    // returns 200 with an empty body in that case, which is still a
+    // valid Prometheus exposition. That's what this test pins:
+    // endpoint reachable, correct content type, 2xx.
+    let state = seeded_state();
+    // Seed some positions + heartbeat so the snapshot path exercises
+    // the async reads even without a recorder installed.
+    state.positions.write().await.push(Position {
+        position_id: 1,
+        symbol_id: 1,
+        side: "BUY",
+        volume: 0.1,
+        entry_price: Some(1.0),
+        stop_loss: None,
+        take_profit: None,
+        swap: 0.0,
+        commission: 0.0,
+        open_timestamp_ms: Some(0),
+    });
+    state.mark_heartbeat();
+
+    let req = Request::builder()
+        .uri("/metrics")
+        .body(Body::empty())
+        .unwrap();
+    let resp = app(state).oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        ct.starts_with("text/plain"),
+        "expected text/plain content type, got {ct}"
+    );
+    // Body is either empty (no recorder in tests) or valid Prometheus
+    // text — both are acceptable. If a prior test did install a
+    // recorder, we at least confirm the body is UTF-8.
+    let body = to_bytes(resp.into_body(), 1_000_000).await.unwrap();
+    assert!(std::str::from_utf8(&body).is_ok());
+}
+
+#[test]
+fn ws_frame_kind_str_matches_serialised_tag() {
+    // The Prometheus `kind` label values in `/metrics` must stay in sync
+    // with the `kind` tag that serde emits on the wire — otherwise
+    // dashboards built on log frames and dashboards built on metrics
+    // disagree. Lock both sides by round-tripping one frame per variant.
+    use crate::api::dto::{ConnectionState, LogLevel, OrderStatus, Side, WsFrame};
+
+    let samples: Vec<(WsFrame, &'static str)> = vec![
+        (
+            WsFrame::Tick {
+                symbol: "EURUSD".into(),
+                bid: 1.0,
+                ask: 1.1,
+                time: 0,
+            },
+            "tick",
+        ),
+        (
+            WsFrame::Execution {
+                order_id: "1".into(),
+                status: OrderStatus::Filled,
+                detail: None,
+            },
+            "execution",
+        ),
+        (
+            WsFrame::PositionUpdate {
+                position: dto::Position {
+                    id: "1".into(),
+                    symbol: "EURUSD".into(),
+                    side: Side::Buy,
+                    volume: 0.1,
+                    open_price: 1.0,
+                    pnl: 0.0,
+                    swap: 0.0,
+                    commission: 0.0,
+                    opened_at: "2026-04-18T00:00:00Z".into(),
+                },
+            },
+            "position_update",
+        ),
+        (
+            WsFrame::PositionClosed {
+                position_id: "1".into(),
+            },
+            "position_closed",
+        ),
+        (
+            WsFrame::OrderUpdate {
+                order: dto::Order {
+                    id: "1".into(),
+                    symbol: "EURUSD".into(),
+                    side: Side::Buy,
+                    kind: dto::OrderKind::Market,
+                    volume: 0.1,
+                    price: None,
+                    stop_loss: None,
+                    take_profit: None,
+                    status: OrderStatus::Filled,
+                    created_at: "2026-04-18T00:00:00Z".into(),
+                },
+            },
+            "order_update",
+        ),
+        (
+            WsFrame::Status {
+                connection: ConnectionState::Authenticated,
+            },
+            "status",
+        ),
+        (WsFrame::Heartbeat { at: 0 }, "heartbeat"),
+        (
+            WsFrame::Log {
+                level: LogLevel::Info,
+                message: "hi".into(),
+                fields: None,
+                at: "2026-04-18T00:00:00Z".into(),
+            },
+            "log",
+        ),
+    ];
+    for (frame, expected) in samples {
+        assert_eq!(frame.kind_str(), expected, "kind_str mismatch");
+        let json: serde_json::Value = serde_json::to_value(&frame).unwrap();
+        assert_eq!(
+            json["kind"], expected,
+            "serde tag disagrees with kind_str for {expected}"
+        );
+    }
+}
